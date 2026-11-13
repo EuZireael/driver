@@ -1,0 +1,125 @@
+# Сборка easy_drv.dll для ручной проверки PR на чистой Windows 7.
+#
+# Эта ветка (ci/build-test) живёт только в форке и в upstream не предлагается.
+# Сам код берётся из savushkin-r-d/driver: master и ветки PR #18 и #19.
+# Готовые DLL — в артефактах запуска (вкладка Actions → запуск → Artifacts).
+
+name: Сборка драйвера для проверки PR
+
+on:
+  push:
+    branches: [ci/build-test]
+  workflow_dispatch:
+
+jobs:
+  # Основной путь — как собирают в команде: проект Visual Studio, Release|Win32.
+  msbuild:
+    name: MSBuild ${{ matrix.name }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: master
+            ref: master
+          - name: pr18-static-runtime
+            ref: refs/pull/18/head
+          - name: pr19-hide-log-window
+            ref: refs/pull/19/head
+          # #19 сделан от master без #18, поэтому его DLL тоже требует VC++ Redist
+          # и на чистой Win7 не загрузится. Для проверки окна лога — #19 со слитым #18.
+          - name: pr19-plus-pr18
+            ref: refs/pull/19/head
+            merge: refs/pull/18/head
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: savushkin-r-d/driver
+          ref: ${{ matrix.ref }}
+          fetch-depth: ${{ matrix.merge && '0' || '1' }}
+
+      - name: Слить ${{ matrix.merge }}
+        if: matrix.merge
+        shell: cmd
+        run: |
+          git fetch origin ${{ matrix.merge }}
+          git -c user.name=ci -c user.email=ci@localhost merge --no-edit FETCH_HEAD
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      # PlatformToolset=v143: набора v141_xp (из проекта) на машинах GitHub нет.
+      # Для проверки рантайма это не важно — ключ /MT от набора не зависит.
+      # Post-build копирует DLL на сетевой диск P:\ — здесь его нет, выключаем.
+      # _CL_=/permissive: в v143 stdcpplatest сам включает строгий режим /permissive-,
+      # и старый WTL 9.10 из common\WTL в нём не компилируется (CDCHandle в atlgdi.h).
+      # В v141 такого не было, поэтому возвращаем прежнее поведение.
+      - name: Сборка Release|Win32
+        shell: cmd
+        env:
+          _CL_: /permissive
+        run: >
+          msbuild drivers\easy_drv\easy_drv_vc\easy_drv.vcxproj
+          /p:Configuration=Release /p:Platform=Win32
+          /p:PlatformToolset=v143
+          /p:PostBuildEventUseInBuild=false /p:PreBuildEventUseInBuild=false
+          /p:OutDir=%GITHUB_WORKSPACE%\out\
+          /m /v:minimal
+
+      # Главное для #18: в списке не должно быть MSVCP140 / VCRUNTIME140 / api-ms-win-crt-*.
+      - name: Зависимости DLL
+        shell: cmd
+        run: dumpbin /dependents out\easy_drv.dll
+
+      - name: Упаковка
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory pkg | Out-Null
+          Copy-Item out\easy_drv.dll pkg\PAC_easy_drv_LZ.dll
+          if (Test-Path drivers\easy_drv\easy_drv.ini) { Copy-Item drivers\easy_drv\easy_drv.ini pkg\ }
+          git log --oneline -n 3 | Out-File -Encoding ascii pkg\COMMIT.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: pkg/
+
+  # Второй путь сборки — CMake (его тоже меняет #18). Только для лога, артефактов нет.
+  cmake:
+    name: CMake ${{ matrix.name }}
+    runs-on: windows-2022
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: master
+            ref: master
+          - name: pr18-static-runtime
+            ref: refs/pull/18/head
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: savushkin-r-d/driver
+          ref: ${{ matrix.ref }}
+          submodules: recursive
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      # toluapp ищет установленный Lua через find_package — подсовываем Lua из подмодуля.
+      # luaconf.h подмодуль lua генерирует в build/lua, поэтому каталогов два.
+      - name: Сборка
+        shell: pwsh
+        run: |
+          $ws = $env:GITHUB_WORKSPACE -replace '\\','/'
+          cmake -S . -B build -A Win32 "-DLUA_INCLUDE_DIR=$ws/lua/src;$ws/build/lua" "-DLUA_LIBRARIES=liblua_static"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build --config Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Зависимости DLL
+        shell: cmd
+        run: dumpbin /dependents build\Release\easy_drv.dll
